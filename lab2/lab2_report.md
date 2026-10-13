@@ -180,6 +180,22 @@ await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 ![/city с несуществующим городом](screenshots/03_city_error.png)
 
+**Меню команд при вводе `/`** — Telegram показывает список команд бота с описаниями на русском (`/add`, `/list`, `/today`, `/weather`, `/city` и далее по списку).
+
+![Меню команд](screenshots/04_menu.png)
+
+**`/today`** — строка с погодой в городе пользователя (+6°C, пасмурно, значок зонта), ниже блок «С напоминанием» с задачей на 19:50.
+
+![/today](screenshots/05_today.png)
+
+**Сработавшее напоминание** — в назначенное время бот прислал напоминание, а в конце сообщения добавил краткую погоду.
+
+![Напоминание с погодой](screenshots/06_reminder_weather.png)
+
+**`/week`** — задачи, созданные за последние 7 дней (запрос к SQLite).
+
+![/week](screenshots/07_week.png)
+
 ### Видео-демо
 
 Ссылка (Google Drive): [видео-демо работы бота](https://drive.google.com/file/d/1-9vJ3noZhtvydN7-cOkMD5FQtzr5Dc5U/view?usp=sharing)
