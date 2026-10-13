@@ -176,6 +176,10 @@ await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 ![/add и /search](screenshots/02_add_search.png)
 
+**`/city Нигденск`** — обработка ошибки: город не найден, бот отвечает понятным сообщением и не падает. Слева от поля ввода видна кнопка «Menu» — это меню команд Telegram, которое бот регистрирует при запуске.
+
+![/city с несуществующим городом](screenshots/03_city_error.png)
+
 ### Видео-демо
 
 Ссылка (Google Drive): [видео-демо работы бота](https://drive.google.com/file/d/1-9vJ3noZhtvydN7-cOkMD5FQtzr5Dc5U/view?usp=sharing)
