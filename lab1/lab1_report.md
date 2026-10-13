@@ -6,11 +6,11 @@ Group: U4225
 Author: Kaasamani Roni Bahaaevich  
 Lab: Lab1  
 Date of create: 13.10.2026  
-Date of finished:  
+Date of finished: 13.10.2026  
 
 # Лабораторная работа 1. Создание первого Telegram-бота без программирования
 
-Вариант 3 — **бот-ассистент для задач**. Бот: **<USERNAME_БОТА>** (Telegram). Код создан с помощью LLM (Claude), вручную код не писался.
+Вариант 3 — **бот-ассистент для задач**. Бот: [@itmoftmi_krb_bot](https://t.me/itmoftmi_krb_bot) (Telegram). Код создан с помощью LLM (Claude), вручную код не писался.
 
 ## 1. Описание задачи
 
@@ -110,7 +110,7 @@ Date of finished:
 
 ### Видео-демо
 
-Ссылка: <ССЫЛКА_НА_ВИДЕО> (длительность 2–3 минуты).
+Ссылка (Google Drive): [видео-демо работы бота](https://drive.google.com/file/d/1lXRfOssXeBziYZLpCbhJujmf7LjQMra5/view?usp=sharing)
 
 ## 5. Трудности и решения
 
