@@ -25,6 +25,7 @@
 Токен и часовой пояс читаются из .env (BOT_TOKEN, TIMEZONE).
 """
 
+import io
 import logging
 import os
 import re
@@ -179,6 +180,11 @@ def init_db() -> None:
             )
             """
         )
+        # Миграция (лаб. 3): повтор задачи ('daily' — каждый день). Старые базы
+        # получают колонку без потери данных.
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(tasks)")]
+        if "repeat" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN repeat TEXT")
         # Журнал использования: кто и какую команду вызвал (для /stats)
         conn.execute(
             """
@@ -286,6 +292,36 @@ def db_set_city(user_id: int, city: str, lat: float, lon: float) -> None:
             "city = excluded.city, lat = excluded.lat, lon = excluded.lon",
             (user_id, city, lat, lon),
         )
+
+
+def db_clear_city(user_id: int) -> None:
+    """Отключает погоду: забывает город пользователя."""
+    with closing(db_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE users SET city = NULL, lat = NULL, lon = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def db_progress_rows(user_id: int, days: int = 60):
+    """Задачи пользователя, созданные или выполненные за последние days дней."""
+    cutoff = now_ts() - days * 24 * 3600
+    with closing(db_connect()) as conn:
+        return conn.execute(
+            "SELECT created_at, completed_at, status FROM tasks WHERE user_id = ? "
+            "AND (created_at >= ? OR completed_at >= ?)",
+            (user_id, cutoff, cutoff),
+        ).fetchall()
+
+
+def db_calendar_tasks(user_id: int):
+    """Активные задачи с напоминанием — для экспорта в календарь."""
+    with closing(db_connect()) as conn:
+        return conn.execute(
+            "SELECT * FROM tasks WHERE user_id = ? AND status = 'active' "
+            "AND remind_at IS NOT NULL ORDER BY remind_at",
+            (user_id,),
+        ).fetchall()
 
 
 def db_search_tasks(user_id: int, query: str, limit: int = 20):
@@ -444,6 +480,8 @@ def fmt_task(task) -> str:
     line = f"#{task['num']} {task['text']}"
     if task["remind_at"] and not task["reminded"]:
         line += f"  ⏰ {fmt_dt(task['remind_at'])}"
+    if task["repeat"] == "daily":
+        line += "  🔁 каждый день"
     return line
 
 
@@ -528,6 +566,18 @@ def schedule_job(job_queue, task) -> None:
     )
 
 
+def next_daily_ts(remind_at: int, now: int | None = None) -> int:
+    """Следующее срабатывание ежедневной задачи: прежнее время + N суток, строго после now."""
+    now = now_ts() if now is None else now
+    if remind_at > now:
+        return remind_at
+    # Календарные сутки в часовом поясе бота (переход на летнее время учитывается)
+    current = datetime.fromtimestamp(remind_at, TZ)
+    while int(current.timestamp()) <= now:
+        current = (current + timedelta(days=1)).replace(tzinfo=TZ)
+    return int(current.timestamp())
+
+
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Срабатывает в назначенное время и присылает напоминание."""
     task_id = context.job.data
@@ -553,9 +603,18 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     except weather.WeatherError as err:
         logger.info("Погода для напоминания недоступна: %s", err)
 
+    if task["repeat"] == "daily":
+        text += "\n🔁 Ежедневная задача. Отметить на сегодня — /done " + str(task["num"])
+
     try:
         await context.bot.send_message(chat_id=task["chat_id"], text=text)
-        db_update(task_id, reminded=1)
+        if task["repeat"] == "daily":
+            # Ежедневная задача: назначаем следующее напоминание (строго в будущем)
+            next_ts = next_daily_ts(task["remind_at"])
+            db_update(task_id, remind_at=next_ts, reminded=0)
+            schedule_job(context.job_queue, db_get_task(task["user_id"], task["num"]))
+        else:
+            db_update(task_id, reminded=1)
     except Exception:
         logger.exception("Не удалось отправить напоминание по задаче id=%s", task_id)
 
@@ -564,9 +623,12 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 BOT_COMMANDS = [
     BotCommand("add", "Добавить задачу"),
     BotCommand("list", "Активные задачи по приоритетам"),
-    BotCommand("today", "План на сегодня и погода"),
-    BotCommand("weather", "Погода сейчас"),
-    BotCommand("city", "Задать город для погоды"),
+    BotCommand("today", "План на сегодня"),
+    BotCommand("plan", "План: сегодня, завтра, неделя, потом"),
+    BotCommand("progress", "Прогресс за неделю и серия дней"),
+    BotCommand("calendar", "Выгрузить напоминания в календарь"),
+    BotCommand("weather", "Погода (по желанию)"),
+    BotCommand("city", "Задать город для погоды или отключить"),
     BotCommand("remind", "Поставить напоминание"),
     BotCommand("done", "Отметить задачу выполненной"),
     BotCommand("week", "Задачи за последние 7 дней"),
@@ -640,13 +702,18 @@ HELP_TEXT = (
     "🔁 /priority <номер> <1|2|3> — сменить приоритет (/priority 3 1)\n\n"
     "⏰ /remind <номер> <ЧЧ:ММ> — напомнить сегодня/завтра (/remind 3 18:30)\n"
     "⏰ /remind <номер> <ДД.ММ ЧЧ:ММ> — на дату (/remind 3 25.12 09:00)\n"
+    "🔁 /remind <номер> daily <ЧЧ:ММ> — каждый день (/remind 3 daily 20:00)\n"
+    "   «/done» для такой задачи отмечает день, задача остаётся\n"
     "🔕 /unremind <номер> — отменить напоминание\n\n"
-    "🌦 Погода (Open-Meteo):\n"
-    "📍 /city <город> — задать город (/city Москва)\n"
-    "🌤 /weather — погода сейчас; /weather <город> — для другого города\n"
-    "Погода также показывается в /today и в напоминаниях.\n\n"
     "🔎 /search <слово> — поиск по задачам (/search молоко)\n"
-    "🗓 /week — задачи за последние 7 дней\n\n"
+    "🗂 /plan — план: сегодня, завтра, на неделе, потом, без срока\n"
+    "🗓 /week — задачи за последние 7 дней\n"
+    "📈 /progress — график выполненных задач за неделю и серия дней\n"
+    "📆 /calendar — файл .ics: задачи с напоминанием в ваш календарь\n\n"
+    "🌦 Погода — по желанию (Open-Meteo):\n"
+    "📍 /city <город> — включить погоду в /today и напоминаниях\n"
+    "📍 /city off — отключить погоду\n"
+    "🌤 /weather — погода сейчас; /weather <город> — для другого города\n\n"
     "📝 /feedback — оставить отзыв о боте (короткий опрос)"
 )
 
@@ -658,8 +725,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 Привет! Я бот-ассистент для задач.\n\n"
         "Просто напишите задачу — я её запомню. "
         "Добавьте !1, !2 или !3, чтобы задать приоритет.\n"
-        "Задайте город (/city Москва) — покажу погоду в /today и в напоминаниях.\n"
         "Список команд — /help или введите «/».\n"
+        "Напоминания можно выгрузить в календарь (/calendar), "
+        "а успехи за неделю посмотреть в /progress.\n"
+        "Нужна погода? Это по желанию: /city Москва.\n"
         "Понравился бот? Оставьте отзыв: /feedback",
     )
 
@@ -735,8 +804,6 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         info = await user_weather(user_id)
         if info:
             weather_line = weather.format_short(*info)
-        else:
-            weather_line = "📍 Задайте город (/city Москва), и я покажу погоду."
     except weather.WeatherError as err:
         logger.info("Погода для /today недоступна: %s", err)
         weather_line = "🌡 Погода сейчас недоступна."
@@ -754,7 +821,9 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Важные задачи (без дублей тех, что уже в списке напоминаний)
     high = [t for t in tasks if t["priority"] == 1 and t["id"] not in reminder_ids]
 
-    parts = ["📅 На сегодня:", weather_line]
+    parts = ["📅 На сегодня:"]
+    if weather_line:  # погода — по желанию: без города строки нет
+        parts.append(weather_line)
     if not with_reminder and not high:
         parts.append("\n🎉 Ничего срочного нет!")
         await reply(update, "\n".join(parts))
@@ -777,6 +846,20 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) != 1:
         raise UserError("❌ Укажите номер задачи. Пример: /done 3")
     task = get_active_task(update.effective_user.id, parse_number(context.args[0]))
+
+    # Ежедневная задача: фиксируем выполнение за сегодня копией и оставляем задачу
+    if task["repeat"] == "daily":
+        copy_num = db_add_task(task["user_id"], task["chat_id"], task["text"], task["priority"])
+        copy = db_get_task(task["user_id"], copy_num)
+        db_update(copy["id"], status="done", completed_at=now_ts())
+        when = datetime.fromtimestamp(task["remind_at"], TZ).strftime("%H:%M") if task["remind_at"] else ""
+        await reply(
+            update,
+            f"🎉 Готово на сегодня! «{task['text']}»\n"
+            f"🔁 Задача останется и повторится завтра{' в ' + when if when else ''}. "
+            f"Остановить повтор — /unremind {task['num']}, удалить — /delete {task['num']}.",
+        )
+        return
 
     # Выполненной задаче напоминание больше не нужно
     cancel_job(context.job_queue, task["id"])
@@ -823,18 +906,39 @@ async def cmd_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await reply(update, f"🔁 Задача #{task['num']} теперь {emoji} {name.lower()}.")
 
 
+DAILY_WORDS = ("daily", "ежедневно", "каждыйдень")
+
+
 async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/remind <номер> <ЧЧ:ММ> или /remind <номер> <ДД.ММ ЧЧ:ММ>."""
     if len(context.args) < 2:
         raise UserError(
             "❌ Формат: /remind <номер> <ЧЧ:ММ> или /remind <номер> <ДД.ММ ЧЧ:ММ>\n"
+            "Каждый день: /remind <номер> daily <ЧЧ:ММ>\n"
             "Пример: /remind 3 18:30"
         )
     task = get_active_task(update.effective_user.id, parse_number(context.args[0]))
+
+    # Ежедневное напоминание: /remind 3 daily 20:00
+    if context.args[1].lower() in DAILY_WORDS:
+        if len(context.args) != 3:
+            raise UserError("❌ Формат: /remind <номер> daily <ЧЧ:ММ>\nПример: /remind 3 daily 20:00")
+        when = parse_remind_time(context.args[2:])
+        db_update(task["id"], remind_at=int(when.timestamp()), reminded=0, repeat="daily")
+        schedule_job(context.job_queue, db_get_task(task["user_id"], task["num"]))
+        await reply(
+            update,
+            f"🔁 Буду напоминать про задачу #{task['num']} каждый день в "
+            f"{when.strftime('%H:%M')}. Первое напоминание — {when.strftime('%d.%m в %H:%M')}.\n"
+            f"Отметить на сегодня — /done {task['num']}, остановить повтор — /unremind {task['num']}.",
+        )
+        return
+
     when = parse_remind_time(context.args[1:])
 
-    # Сохраняем в базу (чтобы пережить перезапуск) и планируем в JobQueue
-    db_update(task["id"], remind_at=int(when.timestamp()), reminded=0)
+    # Сохраняем в базу (чтобы пережить перезапуск) и планируем в JobQueue.
+    # Обычное напоминание отключает ежедневный повтор.
+    db_update(task["id"], remind_at=int(when.timestamp()), reminded=0, repeat=None)
     schedule_job(context.job_queue, db_get_task(task["user_id"], task["num"]))
     await reply(
         update,
@@ -848,10 +952,10 @@ async def cmd_unremind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         raise UserError("❌ Укажите номер задачи. Пример: /unremind 3")
     task = get_active_task(update.effective_user.id, parse_number(context.args[0]))
 
-    if not task["remind_at"] or task["reminded"]:
+    if not task["remind_at"] or (task["reminded"] and task["repeat"] != "daily"):
         raise UserError(f"ℹ️ У задачи #{task['num']} нет активного напоминания.")
     cancel_job(context.job_queue, task["id"])
-    db_update(task["id"], remind_at=None, reminded=0)
+    db_update(task["id"], remind_at=None, reminded=0, repeat=None)
     await reply(update, f"🔕 Напоминание для задачи #{task['num']} отменено.")
 
 
@@ -864,6 +968,11 @@ async def cmd_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply(update, f"📍 Ваш город: {row['city']}\nСменить: /city <город>")
             return
         raise UserError("❌ Укажите город. Пример: /city Москва")
+
+    if " ".join(context.args).strip().lower() in ("off", "выкл", "откл", "отключить"):
+        db_clear_city(user_id)
+        await reply(update, "🔕 Погода отключена. Включить снова: /city <город>")
+        return
 
     try:
         city = await weather.geocode(" ".join(context.args))
@@ -892,6 +1001,213 @@ async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         raise UserError(str(err)) from err
 
     await reply(update, weather.format_full(place, data))
+
+
+PLAN_GROUPS = [
+    ("today", "📍 Сегодня"),
+    ("tomorrow", "🌅 Завтра"),
+    ("week", "🗓 На неделе (до 7 дней)"),
+    ("later", "📦 Потом (дальше недели)"),
+    ("nodate", "🗒 Без срока"),
+]
+
+
+def plan_group(task, today) -> str:
+    """В какую группу плана попадает задача — по дате ближайшего напоминания."""
+    if not task["remind_at"] or (task["reminded"] and task["repeat"] != "daily"):
+        return "nodate"
+    day = datetime.fromtimestamp(task["remind_at"], TZ).date()
+    if day <= today:  # просроченные напоминания тоже показываем сегодня
+        return "today"
+    if day == today + timedelta(days=1):
+        return "tomorrow"
+    if day <= today + timedelta(days=7):
+        return "week"
+    return "later"
+
+
+def build_plan(tasks, today) -> dict:
+    """Раскладывает активные задачи по группам плана (внутри группы: время, приоритет, номер)."""
+    groups = {key: [] for key, _ in PLAN_GROUPS}
+    for task in tasks:
+        groups[plan_group(task, today)].append(task)
+    for items in groups.values():
+        items.sort(key=lambda t: (t["remind_at"] or 0, t["priority"], t["num"]))
+    # Без срока: сначала по приоритету
+    groups["nodate"].sort(key=lambda t: (t["priority"], t["num"]))
+    return groups
+
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/plan — задачи по срокам: сегодня, завтра, на неделе, потом, без срока."""
+    tasks = db_active_tasks(update.effective_user.id)
+    if not tasks:
+        await reply(update, "📭 Активных задач нет. Напишите что-нибудь — добавлю!")
+        return
+    groups = build_plan(tasks, datetime.now(TZ).date())
+    parts = ["🗂 План по срокам:"]
+    for key, title in PLAN_GROUPS:
+        items = groups[key]
+        if not items:
+            continue
+        parts.append(f"\n{title} ({len(items)}):")
+        for t in items:
+            emoji = PRIORITIES[t["priority"]][0]
+            when = ""
+            if key != "nodate" and t["remind_at"]:
+                fmt = "%H:%M" if key == "today" else "%d.%m %H:%M"
+                when = datetime.fromtimestamp(t["remind_at"], TZ).strftime(fmt) + " — "
+            repeat = " 🔁" if t["repeat"] == "daily" else ""
+            parts.append(f"{when}{emoji} #{t['num']} {t['text']}{repeat}")
+    parts.append("\nДобавить срок: /remind <номер> <ЧЧ:ММ>, каждый день: /remind <номер> daily <ЧЧ:ММ>")
+    await reply(update, "\n".join(parts))
+
+
+BAR_MAX = 10  # максимальная длина «столбика» на графике
+
+
+def bar(value: int) -> str:
+    """Текстовый столбик: ███░░ (не длиннее BAR_MAX)."""
+    filled = min(value, BAR_MAX)
+    return "█" * filled + "░" * (BAR_MAX - filled) if filled else "·"
+
+
+def progress_stats(rows, today, days: int = 7):
+    """
+    Считает данные для /progress по строкам задач.
+    Возвращает (по_дням, создано, выполнено, серия), где по_дням — список
+    (дата, создано, выполнено) от старой даты к новой; серия — число дней подряд
+    (до сегодня включительно, а если сегодня ничего — до вчера) с выполненной задачей.
+    """
+    created_by, done_by = {}, {}
+    for row in rows:
+        c_day = datetime.fromtimestamp(row["created_at"], TZ).date()
+        created_by[c_day] = created_by.get(c_day, 0) + 1
+        if row["status"] == "done" and row["completed_at"]:
+            d_day = datetime.fromtimestamp(row["completed_at"], TZ).date()
+            done_by[d_day] = done_by.get(d_day, 0) + 1
+
+    per_day = []
+    for i in range(days - 1, -1, -1):
+        day = today - timedelta(days=i)
+        per_day.append((day, created_by.get(day, 0), done_by.get(day, 0)))
+
+    total_created = sum(c for _, c, _ in per_day)
+    total_done = sum(d for _, _, d in per_day)
+
+    streak = 0
+    day = today if done_by.get(today) else today - timedelta(days=1)
+    while done_by.get(day):
+        streak += 1
+        day -= timedelta(days=1)
+    return per_day, total_created, total_done, streak
+
+
+WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/progress — выполненные задачи за 7 дней по дням и серия дней подряд."""
+    rows = db_progress_rows(update.effective_user.id)
+    today = datetime.now(TZ).date()
+    per_day, created, done, streak = progress_stats(rows, today)
+    if created == 0 and done == 0:
+        await reply(
+            update,
+            "📈 За последние 7 дней пока нет задач. Добавьте задачу — и здесь "
+            "появится график выполнения.",
+        )
+        return
+    lines = ["📈 Прогресс за 7 дней (выполнено задач в день):", ""]
+    for day, _, d in per_day:
+        lines.append(f"{day.strftime('%d.%m')} {WEEKDAYS[day.weekday()]}  {bar(d)} {d}")
+    percent = round(done * 100 / created) if created else 0
+    lines.append("")
+    lines.append(f"✅ Выполнено: {done}  ·  📝 Создано: {created}")
+    if created:
+        lines.append(f"🎯 Доля выполненных за неделю: {percent}%")
+    if streak >= 2:
+        lines.append(f"🔥 Серия: {streak} дн. подряд")
+    elif streak == 1:
+        lines.append("🔥 Серия: 1 день — продолжайте завтра!")
+    else:
+        lines.append("🔥 Серия: пока нет — выполните задачу сегодня")
+    await reply(update, "\n".join(lines))
+
+
+def ics_escape(text: str) -> str:
+    """Экранирует текст для поля iCalendar (RFC 5545)."""
+    return (
+        text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+        .replace("\r", "").replace("\n", "\\n")
+    )
+
+
+def ics_fold(line: str) -> list[str]:
+    """Переносит длинную строку по правилу iCalendar: не более 75 байт в строке."""
+    parts, current = [], ""
+    for ch in line:
+        limit = 75 if not parts else 74  # у продолжений впереди пробел
+        if len((current + ch).encode("utf-8")) > limit:
+            parts.append(current)
+            current = ch
+        else:
+            current += ch
+    parts.append(current)
+    return [parts[0]] + [" " + part for part in parts[1:]]
+
+
+def build_ics(tasks) -> str:
+    """Файл календаря .ics: каждая задача с напоминанием — событие на 30 минут."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//task-bot//itmoftmi_krb_bot//RU",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
+    for task in tasks:
+        start = datetime.fromtimestamp(task["remind_at"], timezone.utc)
+        end = start + timedelta(minutes=30)
+        emoji = PRIORITIES[task["priority"]][0]
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:task-{task['user_id']}-{task['num']}@task-bot",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTEND:{end.strftime('%Y%m%dT%H%M%SZ')}",
+            f"SUMMARY:{ics_escape(emoji + ' ' + task['text'])}",
+            f"DESCRIPTION:{ics_escape('Задача #' + str(task['num']) + ' из бота')}",
+        ]
+        if task["repeat"] == "daily":
+            lines.append("RRULE:FREQ=DAILY")  # ежедневная задача повторяется в календаре
+        lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    folded = []
+    for line in lines:
+        folded.extend(ics_fold(line))
+    return "\r\n".join(folded) + "\r\n"
+
+
+async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/calendar — отправляет файл .ics с задачами, у которых есть напоминание."""
+    tasks = db_calendar_tasks(update.effective_user.id)
+    if not tasks:
+        raise UserError(
+            "📆 Нет задач с напоминанием. Поставьте напоминание, например "
+            "/remind 1 18:30, и повторите /calendar."
+        )
+    data = build_ics(tasks).encode("utf-8")
+    document = io.BytesIO(data)
+    document.name = "tasks.ics"
+    await update.message.reply_document(
+        document,
+        caption=(
+            f"📆 Задач в календаре: {len(tasks)}. Откройте файл — события добавятся "
+            "в ваш календарь (Google, Apple, Outlook)."
+        ),
+    )
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1284,6 +1600,9 @@ def main() -> None:
         "cancel": cmd_cancel,
         "stats": cmd_stats,
         "feedbacks": cmd_feedbacks,
+        "plan": cmd_plan,
+        "progress": cmd_progress,
+        "calendar": cmd_calendar,
     }
     for name, handler in commands.items():
         app.add_handler(CommandHandler(name, safe(handler)))

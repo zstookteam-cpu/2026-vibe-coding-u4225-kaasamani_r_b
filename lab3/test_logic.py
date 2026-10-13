@@ -10,6 +10,7 @@ import re
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -405,9 +406,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Погода сейчас недоступна", text)
         self.assertIn("Важное дело", text, "задачи должны показываться и без погоды")
 
-    async def test_today_without_city_hints(self):
+    async def test_today_without_city_has_no_weather_nag(self):
+        # Лаб. 3: погода по желанию — без города /today не упоминает погоду
         update, _ = await self.run_cmd(bot.cmd_today)
-        self.assertIn("/city", replies(update)[0])
+        text = replies(update)[0]
+        self.assertNotIn("/city", text)
+        self.assertNotIn("погод", text.lower())
 
     # --- напоминание
     async def _reminder(self):
@@ -648,6 +652,341 @@ class FeedbackAndStatsTests(unittest.IsolatedAsyncioTestCase):
         asyncio.run(run())
         self.assertLessEqual(len(weather._cache), weather.MAX_CACHE_SIZE + 1)
         weather._cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Лаб. 3: улучшения по отзывам (погода по желанию, /progress, /calendar)
+# ---------------------------------------------------------------------------
+
+class FeedbackImprovementsTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_path = bot.DB_PATH
+        bot.DB_PATH = os.path.join(self.tmp.name, "t.db")
+        bot.init_db()
+
+    def tearDown(self):
+        bot.DB_PATH = self._old_path
+        self.tmp.cleanup()
+
+    async def run_cmd(self, handler, *args, user_id=1):
+        update, context = make_update(user_id), make_context(*args)
+        await bot.safe(handler)(update, context)
+        return update, context
+
+    # --- погода по желанию
+    async def test_city_off(self):
+        bot.db_set_city(1, "Москва", 55.75, 37.62)
+        update, _ = await self.run_cmd(bot.cmd_city, "off")
+        self.assertIn("отключена", replies(update)[0])
+        self.assertIsNone(bot.db_get_user(1)["lat"])
+        # после отключения /today не вызывает погоду
+        with patch.object(weather, "_get_json", AsyncMock(side_effect=AssertionError)):
+            update, _ = await self.run_cmd(bot.cmd_today)
+        self.assertNotIn("погод", replies(update)[0].lower())
+
+    async def test_city_off_without_city_is_safe(self):
+        update, _ = await self.run_cmd(bot.cmd_city, "off")
+        self.assertIn("отключена", replies(update)[0])
+
+    def test_start_does_not_push_weather(self):
+        update = make_update()
+        import asyncio
+        asyncio.run(bot.cmd_start(update, make_context()))
+        text = replies(update)[0]
+        self.assertIn("/progress", text)
+        self.assertIn("/calendar", text)
+        self.assertIn("по желанию", text)
+
+    def test_help_mentions_new_commands(self):
+        for text in ("/progress", "/calendar", "/city off"):
+            self.assertIn(text, bot.HELP_TEXT)
+
+    # --- /progress
+    def _task(self, user_id, days_ago_created, days_ago_done=None, hour=12):
+        now = datetime.now(bot.TZ).replace(hour=hour, minute=0, second=0, microsecond=0)
+        num = bot.db_add_task(user_id, 10, f"t{days_ago_created}-{days_ago_done}", 2)
+        task = bot.db_get_task(user_id, num)
+        fields = {"created_at": int((now - timedelta(days=days_ago_created)).timestamp())}
+        if days_ago_done is not None:
+            fields["status"] = "done"
+            fields["completed_at"] = int((now - timedelta(days=days_ago_done)).timestamp())
+        bot.db_update(task["id"], **fields)
+
+    def test_progress_stats_and_streak(self):
+        for _ in range(2):
+            self._task(1, 3, 0)          # выполнено сегодня
+        self._task(1, 2, 1)              # вчера
+        self._task(1, 5, 2)              # позавчера
+        self._task(1, 0)                 # создана сегодня, не выполнена
+        self._task(2, 0, 0)              # чужая задача не учитывается
+        rows = bot.db_progress_rows(1)
+        today = datetime.now(bot.TZ).date()
+        per_day, created, done, streak = bot.progress_stats(rows, today)
+        self.assertEqual(len(per_day), 7)
+        self.assertEqual((created, done), (5, 4))
+        self.assertEqual(per_day[-1][2], 2)   # сегодня выполнено 2
+        self.assertEqual(streak, 3)
+
+    def test_progress_streak_counts_from_yesterday(self):
+        self._task(1, 2, 1)
+        self._task(1, 3, 2)
+        today = datetime.now(bot.TZ).date()
+        *_, streak = bot.progress_stats(bot.db_progress_rows(1), today)
+        self.assertEqual(streak, 2)
+
+    def test_progress_streak_broken(self):
+        self._task(1, 5, 4)
+        today = datetime.now(bot.TZ).date()
+        *_, streak = bot.progress_stats(bot.db_progress_rows(1), today)
+        self.assertEqual(streak, 0)
+
+    async def test_progress_empty(self):
+        update, _ = await self.run_cmd(bot.cmd_progress)
+        self.assertIn("пока нет задач", replies(update)[0])
+
+    async def test_progress_output(self):
+        self._task(1, 1, 0)
+        self._task(1, 1, 0)
+        update, _ = await self.run_cmd(bot.cmd_progress)
+        text = replies(update)[0]
+        self.assertIn("Прогресс за 7 дней", text)
+        self.assertIn("██", text)
+        self.assertIn("Выполнено: 2", text)
+        self.assertIn("100%", text)
+
+    def test_bar_capped(self):
+        self.assertEqual(len(bot.bar(50)), bot.BAR_MAX)
+        self.assertEqual(bot.bar(0), "·")
+
+    # --- /calendar
+    def test_ics_escape_and_fold(self):
+        self.assertEqual(bot.ics_escape("a,b;c\\d\nz"), "a\\,b\\;c\\\\d\\nz")
+        folded = bot.ics_fold("SUMMARY:" + "Я" * 100)
+        for line in folded:
+            self.assertLessEqual(len(line.encode("utf-8")), 75)
+        self.assertEqual("".join(l.lstrip(" ") if i else l for i, l in enumerate(folded)),
+                         "SUMMARY:" + "Я" * 100)
+
+    def test_build_ics_structure(self):
+        num = bot.db_add_task(1, 10, "Сдать отчёт, срочно", 1)
+        task = bot.db_get_task(1, num)
+        bot.db_update(task["id"], remind_at=1900000000)
+        ics = bot.build_ics(bot.db_calendar_tasks(1))
+        self.assertTrue(ics.startswith("BEGIN:VCALENDAR\r\n"))
+        self.assertTrue(ics.endswith("END:VCALENDAR\r\n"))
+        self.assertEqual(ics.count("BEGIN:VEVENT"), 1)
+        self.assertIn("DTSTART:20300317T174640Z", ics)
+        self.assertIn("\\,", ics)  # запятая экранирована
+
+    async def test_calendar_without_reminders(self):
+        bot.db_add_task(1, 10, "Без напоминания", 2)
+        update, _ = await self.run_cmd(bot.cmd_calendar)
+        self.assertIn("Нет задач с напоминанием", replies(update)[0])
+
+    async def test_calendar_sends_file_only_own_active_tasks(self):
+        for uid, text in ((1, "Моя"), (2, "Чужая")):
+            num = bot.db_add_task(uid, 10, text, 2)
+            bot.db_update(bot.db_get_task(uid, num)["id"], remind_at=bot.now_ts() + 3600)
+        done = bot.db_add_task(1, 10, "Готовая", 2)
+        bot.db_update(bot.db_get_task(1, done)["id"], remind_at=bot.now_ts() + 3600, status="done")
+        update = make_update(1)
+        update.message.reply_document = AsyncMock()
+        await bot.safe(bot.cmd_calendar)(update, make_context())
+        update.message.reply_document.assert_awaited_once()
+        sent = update.message.reply_document.await_args
+        content = sent.args[0].getvalue().decode("utf-8")
+        self.assertEqual(sent.args[0].name, "tasks.ics")
+        self.assertIn("Моя", content)
+        self.assertNotIn("Чужая", content)
+        self.assertNotIn("Готовая", content)
+
+
+# ---------------------------------------------------------------------------
+# Лаб. 3: /plan и ежедневные задачи (по отзыву №4)
+# ---------------------------------------------------------------------------
+
+class PlanAndDailyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_path = bot.DB_PATH
+        bot.DB_PATH = os.path.join(self.tmp.name, "p.db")
+        bot.init_db()
+
+    def tearDown(self):
+        bot.DB_PATH = self._old_path
+        self.tmp.cleanup()
+
+    async def run_cmd(self, handler, *args, user_id=1):
+        update, context = make_update(user_id), make_context(*args)
+        await bot.safe(handler)(update, context)
+        return update, context
+
+    def _task(self, text, priority=2, days=None, hour=15, **extra):
+        num = bot.db_add_task(1, 10, text, priority)
+        task = bot.db_get_task(1, num)
+        fields = dict(extra)
+        if days is not None:
+            when = datetime.now(bot.TZ).replace(hour=hour, minute=0, second=0, microsecond=0) + timedelta(days=days)
+            fields["remind_at"] = int(when.timestamp())
+        if fields:
+            bot.db_update(task["id"], **fields)
+        return bot.db_get_task(1, num)
+
+    # --- миграция
+    def test_migration_adds_repeat_column_to_old_db(self):
+        import sqlite3
+        old = os.path.join(self.tmp.name, "old.db")
+        conn = sqlite3.connect(old)
+        conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, "
+                     "chat_id INTEGER NOT NULL, num INTEGER NOT NULL, text TEXT NOT NULL, "
+                     "priority INTEGER NOT NULL DEFAULT 2, status TEXT NOT NULL DEFAULT 'active', "
+                     "created_at INTEGER NOT NULL, completed_at INTEGER, remind_at INTEGER, "
+                     "reminded INTEGER NOT NULL DEFAULT 0, UNIQUE (user_id, num))")
+        conn.execute("INSERT INTO tasks (user_id, chat_id, num, text, created_at) VALUES (1, 1, 1, 'старая', 1)")
+        conn.commit()
+        conn.close()
+        bot.DB_PATH = old
+        bot.init_db()
+        bot.init_db()  # повторный запуск не ломается
+        row = bot.db_get_task(1, 1)
+        self.assertEqual(row["text"], "старая")
+        self.assertIsNone(row["repeat"])
+
+    # --- /plan
+    def test_plan_groups(self):
+        today = datetime.now(bot.TZ).date()
+        tasks = [
+            self._task("сегодня", days=0, hour=23),
+            self._task("просрочено", days=-1),
+            self._task("завтра", days=1),
+            self._task("через 4 дня", days=4),
+            self._task("через 20 дней", days=20),
+            self._task("без срока", priority=1),
+            self._task("уже напомнили", days=-2, reminded=1),
+        ]
+        groups = bot.build_plan(tasks, today)
+        names = {k: [t["text"] for t in v] for k, v in groups.items()}
+        self.assertEqual(sorted(names["today"]), ["просрочено", "сегодня"])
+        self.assertEqual(names["tomorrow"], ["завтра"])
+        self.assertEqual(names["week"], ["через 4 дня"])
+        self.assertEqual(names["later"], ["через 20 дней"])
+        self.assertEqual(sorted(names["nodate"]), ["без срока", "уже напомнили"])
+        self.assertEqual(names["nodate"][0], "без срока")  # приоритет 1 выше
+
+    def test_plan_daily_task_stays_in_schedule(self):
+        today = datetime.now(bot.TZ).date()
+        task = self._task("полить цветы", days=1, repeat="daily", reminded=1)
+        self.assertEqual(bot.plan_group(task, today), "tomorrow")
+
+    async def test_plan_command(self):
+        self._task("Позвонить", priority=1, days=0, hour=23)
+        self._task("Купить хлеб")
+        update, _ = await self.run_cmd(bot.cmd_plan)
+        text = replies(update)[0]
+        self.assertIn("Сегодня (1)", text)
+        self.assertIn("Без срока (1)", text)
+        self.assertNotIn("Завтра", text)
+        self.assertIn("Позвонить", text)
+
+    async def test_plan_empty(self):
+        update, _ = await self.run_cmd(bot.cmd_plan)
+        self.assertIn("Активных задач нет", replies(update)[0])
+
+    async def test_plan_only_own_tasks(self):
+        num = bot.db_add_task(2, 20, "Чужая", 2)
+        update, _ = await self.run_cmd(bot.cmd_plan)
+        self.assertNotIn("Чужая", replies(update)[0])
+
+    # --- ежедневные задачи
+    async def test_remind_daily_sets_repeat(self):
+        self._task("Полить цветы")
+        update, context = await self.run_cmd(bot.cmd_remind, "1", "daily", "20:00")
+        self.assertIn("каждый день", replies(update)[0])
+        row = bot.db_get_task(1, 1)
+        self.assertEqual(row["repeat"], "daily")
+        self.assertGreater(row["remind_at"], bot.now_ts())
+        context.job_queue.run_once.assert_called_once()
+
+    async def test_remind_daily_bad_format(self):
+        self._task("Полить цветы")
+        update, _ = await self.run_cmd(bot.cmd_remind, "1", "daily")
+        self.assertIn("daily", replies(update)[0])
+        update, _ = await self.run_cmd(bot.cmd_remind, "1", "daily", "25:99")
+        self.assertIn("Неверный формат", replies(update)[0])
+        self.assertIsNone(bot.db_get_task(1, 1)["repeat"])
+
+    async def test_plain_remind_clears_repeat(self):
+        self._task("Полить цветы", repeat="daily")
+        await self.run_cmd(bot.cmd_remind, "1", "23:59")
+        self.assertIsNone(bot.db_get_task(1, 1)["repeat"])
+
+    async def test_unremind_stops_daily(self):
+        task = self._task("Полить цветы", days=1, repeat="daily")
+        update, _ = await self.run_cmd(bot.cmd_unremind, "1")
+        self.assertIn("отменено", replies(update)[0])
+        row = bot.db_get_task(1, 1)
+        self.assertIsNone(row["repeat"])
+        self.assertIsNone(row["remind_at"])
+
+    async def test_done_on_daily_keeps_task_and_records_completion(self):
+        self._task("Полить цветы", days=1, repeat="daily")
+        update, _ = await self.run_cmd(bot.cmd_done, "1")
+        self.assertIn("Готово на сегодня", replies(update)[0])
+        original = bot.db_get_task(1, 1)
+        self.assertEqual(original["status"], "active")
+        self.assertEqual(original["repeat"], "daily")
+        done = bot.db_completed_tasks(1)
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0]["text"], "Полить цветы")
+        # выполнение попадает в статистику /progress
+        today = datetime.now(bot.TZ).date()
+        _, _, done_count, streak = bot.progress_stats(bot.db_progress_rows(1), today)
+        self.assertEqual((done_count, streak), (1, 1))
+
+    def test_next_daily_ts(self):
+        now = bot.now_ts()
+        self.assertEqual(bot.next_daily_ts(now + 100, now), now + 100)
+        past = now - 3 * 24 * 3600 - 60
+        nxt = bot.next_daily_ts(past, now)
+        self.assertGreater(nxt, now)
+        self.assertLessEqual(nxt - now, 24 * 3600 + 3600)
+        self.assertEqual(
+            datetime.fromtimestamp(nxt, bot.TZ).strftime("%H:%M"),
+            datetime.fromtimestamp(past, bot.TZ).strftime("%H:%M"),
+        )
+
+    async def test_send_reminder_reschedules_daily(self):
+        task = self._task("Полить цветы", repeat="daily", remind_at=bot.now_ts())
+        context = make_context()
+        context.job.data = task["id"]
+        context.bot.send_message = AsyncMock()
+        await bot.send_reminder(context)
+        text = context.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Ежедневная задача", text)
+        row = bot.db_get_task(1, 1)
+        self.assertGreater(row["remind_at"], bot.now_ts())
+        self.assertEqual(row["reminded"], 0)
+        context.job_queue.run_once.assert_called_once()
+
+    async def test_send_reminder_one_time_marks_reminded(self):
+        task = self._task("Разово", remind_at=bot.now_ts())
+        context = make_context()
+        context.job.data = task["id"]
+        context.bot.send_message = AsyncMock()
+        await bot.send_reminder(context)
+        self.assertEqual(bot.db_get_task(1, 1)["reminded"], 1)
+        context.job_queue.run_once.assert_not_called()
+
+    def test_list_marks_daily(self):
+        task = self._task("Полить цветы", days=1, repeat="daily")
+        self.assertIn("🔁", bot.fmt_task(task))
+
+    def test_ics_daily_has_rrule(self):
+        self._task("Полить цветы", days=1, repeat="daily")
+        self._task("Разово", days=1)
+        ics = bot.build_ics(bot.db_calendar_tasks(1))
+        self.assertEqual(ics.count("RRULE:FREQ=DAILY"), 1)
 
 
 if __name__ == "__main__":
